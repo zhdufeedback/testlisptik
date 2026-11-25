@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Тихий сосед — Архив</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
   <style>
     :root {
       --bg: #030303;
@@ -700,6 +702,7 @@
       </div>
       <div id="admin-panel" style="display:none">
         <h2 class="section-title">Регистрации</h2>
+        <p id="cloud-status" style="font-size:12px;color:var(--dim);margin:-10px 0 14px"></p>
         <div class="admin-toolbar">
           <input type="text" id="search-input" placeholder="Поиск по имени, телефону или коду">
         </div>
@@ -916,10 +919,27 @@
       btn.addEventListener('click', () => showSection(btn.dataset.goto));
     });
 
-    // Safe storage: works even in sandboxed iframes without allow-same-origin
+    // ========== SHARED DATABASE (Firebase) ==========
+    // 1) Создай проект на https://console.firebase.google.com
+    // 2) Build → Realtime Database → Create Database (start in test mode)
+    // 3) Project settings → Your apps → Web → скопируй config сюда
+    // Пока конфиг пустой — работает только локально (как раньше).
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyB8S6RaP3SExDh5EvdBq2q3_9duZlG2v_k",
+      authDomain: "horror-7c0c0.firebaseapp.com",
+      databaseURL: "https://horror-7c0c0-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "horror-7c0c0",
+      storageBucket: "horror-7c0c0.firebasestorage.app",
+      messagingSenderId: "773448168223",
+      appId: "1:773448168223:web:ee32b0dbb1ecfa32aab62a",
+      measurementId: "G-WBCNQZELZN"
+    };
+
     const STORAGE_KEY = 'ts_regs_v3';
     const CURRENT_KEY = 'ts_pass_v3';
     const mem = {};
+    let dbRef = null;
+    let cloudReady = false;
 
     function canUseLS() {
       try {
@@ -933,6 +953,41 @@
     }
     const useLS = canUseLS();
 
+    function isFirebaseConfigured() {
+      return !!(FIREBASE_CONFIG && FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.databaseURL);
+    }
+
+    function initCloud() {
+      if (!isFirebaseConfigured()) return;
+      try {
+        if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+        dbRef = firebase.database().ref('registrations');
+        cloudReady = true;
+        // Live sync: any device updates → all devices see it
+        dbRef.on('value', function(snap) {
+          const val = snap.val();
+          const list = val ? Object.keys(val).map(function(k) {
+            return Object.assign({ _id: k }, val[k]);
+          }) : [];
+          // newest first
+          list.sort(function(a, b) { return (b.time || 0) - (a.time || 0); });
+          mem.regs = list;
+          if (useLS) {
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
+          }
+          // refresh admin list if open
+          const panel = document.getElementById('admin-panel');
+          if (panel && panel.style.display !== 'none') {
+            const q = (document.getElementById('search-input') || {}).value || '';
+            if (typeof renderPlayers === 'function') renderPlayers(q);
+          }
+        });
+      } catch (e) {
+        console.warn('Firebase init failed', e);
+        cloudReady = false;
+      }
+    }
+
     function getRegs() {
       if ('regs' in mem) return mem.regs;
       if (!useLS) { mem.regs = []; return mem.regs; }
@@ -943,11 +998,61 @@
       }
       return mem.regs;
     }
+
     function saveRegs(list) {
       mem.regs = list;
-      if (!useLS) return;
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
+      if (useLS) {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
+      }
+      // Note: preferred path is addRegistration / deleteRegistration for cloud
     }
+
+    function addRegistration(record) {
+      // Always keep local/memory in sync
+      const list = getRegs().slice();
+      list.unshift(record);
+      mem.regs = list;
+      if (useLS) {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
+      }
+      if (cloudReady && dbRef) {
+        // push generates unique id shared across devices
+        const payload = {
+          name: record.name,
+          phone: record.phone,
+          code: record.code,
+          time: record.time
+        };
+        dbRef.push(payload).catch(function(err) {
+          console.warn('Cloud write failed', err);
+        });
+      }
+    }
+
+    function deleteRegistration(timeId) {
+      let list = getRegs().filter(function(r) { return r.time !== timeId; });
+      mem.regs = list;
+      if (useLS) {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
+      }
+      if (cloudReady && dbRef) {
+        // find by time field
+        dbRef.orderByChild('time').equalTo(timeId).once('value').then(function(snap) {
+          snap.forEach(function(child) { child.ref.remove(); });
+        }).catch(function() {});
+      }
+    }
+
+    function clearAllRegistrations() {
+      mem.regs = [];
+      if (useLS) {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify([])); } catch (e) {}
+      }
+      if (cloudReady && dbRef) {
+        dbRef.remove().catch(function() {});
+      }
+    }
+
     function getPass() {
       if ('pass' in mem && mem.pass !== undefined) return mem.pass;
       if (!useLS) { mem.pass = null; return null; }
@@ -959,6 +1064,7 @@
       }
       return mem.pass;
     }
+
     function savePass(d) {
       mem.pass = d || null;
       if (!useLS) return;
@@ -967,7 +1073,11 @@
         else localStorage.removeItem(CURRENT_KEY);
       } catch (e) {}
     }
-    function formatTime(ts) {
+
+    // boot cloud as soon as possible
+    initCloud();
+
+        function formatTime(ts) {
       return new Date(ts).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
     }
 
@@ -1063,9 +1173,7 @@
       } catch (e) {}
       const record = { name: name, phone: phone, code: code, time: Date.now() };
       savePass(record);
-      const list = getRegs();
-      list.unshift(record);
-      saveRegs(list);
+      addRegistration(record);
       renderPass(record);
       // Scroll pass into view on mobile
       setTimeout(function() {
@@ -1100,6 +1208,13 @@
         wrongPinCount = 0;
         document.getElementById('pin-screen').style.display = 'none';
         document.getElementById('admin-panel').style.display = 'block';
+        var cs = document.getElementById('cloud-status');
+        if (cs) {
+          if (cloudReady) cs.textContent = '● Общая база подключена — данные со всех устройств';
+          else if (isFirebaseConfigured()) cs.textContent = '○ База настроена, но не подключилась (проверь config / правила)';
+          else cs.textContent = '○ Локальный режим — вставь FIREBASE_CONFIG в коде для общей базы';
+          cs.style.color = cloudReady ? 'var(--green)' : 'var(--dim)';
+        }
         renderPlayers();
       } else {
         pinErr.style.display = 'block';
@@ -1151,7 +1266,7 @@
       box.querySelectorAll('.player-del').forEach(btn => {
         btn.addEventListener('click', () => {
           const t = Number(btn.dataset.t);
-          saveRegs(getRegs().filter(r => r.time !== t));
+          deleteRegistration(t);
           renderPlayers(document.getElementById('search-input').value);
         });
       });
@@ -1170,7 +1285,7 @@
       });
     });
     document.getElementById('clear-all-btn').addEventListener('click', () => {
-      if (confirm('Удалить все записи?')) { saveRegs([]); renderPlayers(); }
+      if (confirm('Удалить все записи?')) { clearAllRegistrations(); renderPlayers(); }
     });
   </script>
 </body>
